@@ -19,6 +19,11 @@ type License struct {
 	IssuedAt  string   `json:"issued_at"`
 	NotBefore string   `json:"not_before"`
 	NotAfter  string   `json:"not_after"`
+	// DelegationKey is the ephemeral public key whose holder may issue
+	// restricted sub-licenses under this one. Empty means the license may
+	// not be delegated. It is covered by the signature, so the delegation
+	// right cannot be added by tampering.
+	DelegationKey []byte `json:"delegation_key,omitempty"`
 }
 
 // Envelope is the serialized, imported license form: claims plus the issuer

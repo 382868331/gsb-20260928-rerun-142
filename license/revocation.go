@@ -13,8 +13,12 @@ func (s *SignedRevocationList) Encode() ([]byte, error) {
 // It is strictly local/offline data: a consumer without the list cannot claim
 // revocation has been checked.
 type RevocationList struct {
-	IssuerID    string   `json:"issuer_id"`
-	KeyID       string   `json:"key_id"`
+	IssuerID string `json:"issuer_id"`
+	KeyID    string `json:"key_id"`
+	// Serial is the issuer-assigned monotonic sequence number. An update
+	// with a serial not greater than the already applied one is rejected,
+	// so replaying older offline material cannot roll the known state back.
+	Serial      uint64   `json:"serial"`
 	GeneratedAt string   `json:"generated_at"`
 	RevokedIDs  []string `json:"revoked_ids"`
 }
