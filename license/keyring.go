@@ -37,6 +37,28 @@ func NewIssuerKey(issuerID, keyID string) (*IssuerSecret, error) {
 	}, nil
 }
 
+// NewDelegationKey generates a fresh temporary key used only to sign
+// restricted sublicenses. It is unrelated to any real device identity.
+func NewDelegationKey(keyID string) (*DelegationSecret, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return &DelegationSecret{
+		DelegationKey: DelegationKey{KeyID: keyID, Key: pub},
+		Secret:        priv,
+	}, nil
+}
+
+// DelegationSecret is the private half of a license-carried delegator key.
+type DelegationSecret struct {
+	DelegationKey
+	Secret []byte `json:"secret"`
+}
+
+// Public returns the delegator record embedded in parent licenses.
+func (d *DelegationSecret) Public() DelegationKey { return d.DelegationKey }
+
 // KeyRing holds every trusted verification key for one or more issuers.
 type KeyRing struct {
 	mu   sync.RWMutex

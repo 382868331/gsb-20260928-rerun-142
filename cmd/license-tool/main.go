@@ -26,8 +26,14 @@ func main() {
 		err = cmdRotate(os.Args[2:])
 	case "issue":
 		err = cmdIssue(os.Args[2:])
+	case "issue-delegated":
+		err = cmdIssueDelegated(os.Args[2:])
+	case "gen-delegator":
+		err = cmdGenDelegator(os.Args[2:])
 	case "revoke":
 		err = cmdRevoke(os.Args[2:])
+	case "revoke-import":
+		err = cmdRevokeImport(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	default:
@@ -47,9 +53,18 @@ commands:
   rotate      --issuer ID --keyring FILE --secret FILE
   issue       --secret FILE --out FILE --license-id ID --device ID
               --features a,b --days N [--at RFC3339]
+              [--delegator-key FILE]  (embed key allowing sublicensing)
+  gen-delegator --key FILE           (fresh temporary delegation keypair)
+  issue-delegated --key FILE --parent FILE --issuer ID --out FILE
+              --license-id ID --device ID --features a,b --days N
+              [--delegator-key FILE] [--at RFC3339]
   revoke      --secret FILE --out FILE --ids license1,license2 [--merge FILE]
+              [--serial N]
+  revoke-import --keyring FILE --store FILE --revocations FILE
   check       --keyring FILE --license FILE --device ID --anchor FILE
-              [--revocations FILE] [--require-revocation]`)
+              [--revocations FILE | --revocation-store FILE]
+              [--require-revocation]
+              (--license accepts a comma-separated root-to-leaf chain)`)
 }
 
 func cmdInitIssuer(args []string) error {
@@ -107,6 +122,7 @@ func cmdIssue(args []string) error {
 	feats := fs.String("features", "", "comma-separated feature names")
 	days := fs.Int("days", 365, "validity in days")
 	at := fs.String("at", "", "issued-at time (RFC3339), default now")
+	delegatorPath := fs.String("delegator-key", "", "temporary delegator public key to embed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -139,7 +155,122 @@ func cmdIssue(args []string) error {
 		NotBefore: now.UTC().Format(time.RFC3339),
 		NotAfter:  now.AddDate(0, 0, *days).UTC().Format(time.RFC3339),
 	}
+	if *delegatorPath != "" {
+		dk, err := loadDelegationKey(*delegatorPath)
+		if err != nil {
+			return err
+		}
+		l.Delegators = []license.DelegationKey{dk.DelegationKey}
+	}
 	env, err := license.NewSigner(secret).Issue(l)
+	if err != nil {
+		return err
+	}
+	data, err := env.Encode()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(*out, data, 0o644)
+}
+
+func cmdGenDelegator(args []string) error {
+	fs := flag.NewFlagSet("gen-delegator", flag.ContinueOnError)
+	keyPath := fs.String("key", "delegator.key.json", "delegation key output")
+	id := fs.String("id", fmt.Sprintf("dk-%d", time.Now().UnixNano()), "delegator key id")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	dk, err := license.NewDelegationKey(*id)
+	if err != nil {
+		return err
+	}
+	data, err := jsonMarshalIndent(dk)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(*keyPath, data, 0o600)
+}
+
+func loadDelegationKey(path string) (*license.DelegationSecret, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var dk license.DelegationSecret
+	if err := jsonUnmarshal(data, &dk); err != nil {
+		return nil, err
+	}
+	return &dk, nil
+}
+
+func cmdIssueDelegated(args []string) error {
+	fs := flag.NewFlagSet("issue-delegated", flag.ContinueOnError)
+	keyPath := fs.String("key", "delegator.key.json", "delegation secret key")
+	parentPath := fs.String("parent", "", "parent license envelope (file to restrict)")
+	issuer := fs.String("issuer", "", "root issuer id of the chain")
+	out := fs.String("out", "sublicense.json", "output file")
+	id := fs.String("license-id", "", "unique sublicense id")
+	device := fs.String("device", "", "bound device id (must equal parent's)")
+	feats := fs.String("features", "", "comma-separated feature names (subset of parent)")
+	days := fs.Int("days", 365, "validity in days (must fit inside parent window)")
+	at := fs.String("at", "", "issued-at time (RFC3339), default now")
+	delegatorPath := fs.String("delegator-key", "", "optional next-level delegator key to embed")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *parentPath == "" || *issuer == "" || *id == "" || *device == "" {
+		return fmt.Errorf("--parent, --issuer, --license-id and --device are required")
+	}
+	dk, err := loadDelegationKey(*keyPath)
+	if err != nil {
+		return err
+	}
+	parentData, err := os.ReadFile(*parentPath)
+	if err != nil {
+		return err
+	}
+	parentEnv, err := license.ParseEnvelope(parentData)
+	if err != nil {
+		return err
+	}
+	now := time.Now()
+	if *at != "" {
+		now, err = time.Parse(time.RFC3339, *at)
+		if err != nil {
+			return err
+		}
+	}
+	parentNbt, err := time.Parse(time.RFC3339, parentEnv.License.NotAfter)
+	if err != nil {
+		return err
+	}
+	var features []string
+	for _, f := range strings.Split(*feats, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			features = append(features, f)
+		}
+	}
+	notAfter := now.AddDate(0, 0, *days).UTC()
+	if notAfter.After(parentNbt) {
+		notAfter = parentNbt
+	}
+	l := license.License{
+		Version:   license.CurrentFormatVersion,
+		LicenseID: *id,
+		DeviceID:  *device,
+		Features:  features,
+		IssuedAt:  now.UTC().Format(time.RFC3339),
+		NotBefore: now.UTC().Format(time.RFC3339),
+		NotAfter:  notAfter.Format(time.RFC3339),
+	}
+	if *delegatorPath != "" {
+		next, err := loadDelegationKey(*delegatorPath)
+		if err != nil {
+			return err
+		}
+		l.Delegators = []license.DelegationKey{next.DelegationKey}
+	}
+	env, err := license.NewDelegationSigner(dk, *issuer).Issue(l, &parentEnv.License)
 	if err != nil {
 		return err
 	}
@@ -156,6 +287,7 @@ func cmdRevoke(args []string) error {
 	out := fs.String("out", "revocations.json", "signed revocation list output")
 	idsFlag := fs.String("ids", "", "comma-separated license ids to revoke")
 	merge := fs.String("merge", "", "existing list whose revoked ids are retained")
+	serial := fs.Int64("serial", 0, "strictly increasing revocation data version")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -177,6 +309,7 @@ func cmdRevoke(args []string) error {
 		}
 	}
 	rl := license.RevocationList{
+		Serial:      *serial,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		RevokedIDs:  dedupe(ids),
 	}
@@ -203,12 +336,47 @@ func loadRevocations(path string) (*license.SignedRevocationList, error) {
 	return &s, nil
 }
 
+func cmdRevokeImport(args []string) error {
+	// Verifies the signed list against the trusted ring and applies it to
+	// the persistent store only when its serial is strictly newer. Older or
+	// non-cumulative data is rejected and changes nothing.
+	fs := flag.NewFlagSet("revoke-import", flag.ContinueOnError)
+	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
+	storePath := fs.String("store", "revocation-store.json", "local revocation state store")
+	revocPath := fs.String("revocations", "", "signed revocation list to import")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *revocPath == "" {
+		return fmt.Errorf("--revocations is required")
+	}
+	ring, err := license.LoadKeyRing(*ringPath)
+	if err != nil {
+		return err
+	}
+	list, err := loadRevocations(*revocPath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadRevocationStore(*storePath)
+	if err != nil {
+		return err
+	}
+	if err := store.Import(ring, list); err != nil {
+		return err
+	}
+	fmt.Printf("imported issuer=%s serial=%d revoked=%v\n",
+		list.List.IssuerID, list.List.Serial, list.List.RevokedIDs)
+	return nil
+}
+
 func cmdCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
 	licensePath := fs.String("license", "license.json", "imported license file")
 	device := fs.String("device", "", "local device id")
 	revocPath := fs.String("revocations", "", "signed revocation list (optional)")
+	storePath := fs.String("revocation-store", "", "persistent monotonic revocation store (optional)")
 	requireRev := fs.Bool("require-revocation", false, "fail when revocation data is missing")
 	anchorPath := fs.String("anchor", "anchor.txt", "per-device monotonic time anchor")
 	if err := fs.Parse(args); err != nil {
@@ -221,9 +389,17 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(*licensePath)
-	if err != nil {
-		return err
+	var chain []*license.Envelope
+	for _, part := range strings.Split(*licensePath, ",") {
+		data, err := os.ReadFile(strings.TrimSpace(part))
+		if err != nil {
+			return err
+		}
+		env, err := license.ParseEnvelope(data)
+		if err != nil {
+			return err
+		}
+		chain = append(chain, env)
 	}
 	anchor := license.NewFileAnchor(*anchorPath)
 	last, err := anchor.Last()
@@ -238,7 +414,14 @@ func cmdCheck(args []string) error {
 		}
 		c.Revocation = r
 	}
-	res, eff, err := c.CheckBytes(data, *device, last)
+	if *storePath != "" {
+		store, err := license.LoadRevocationStore(*storePath)
+		if err != nil {
+			return err
+		}
+		c.RevocationStore = store
+	}
+	res, eff, err := c.CheckChain(chain, *device, last)
 	// Advance the monotonic anchor on EVERY evaluation, including expired
 	// ones: otherwise "expire, then roll the clock back" could resurrect the
 	// license on the next run.
