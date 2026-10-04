@@ -20,6 +20,10 @@ type License struct {
 	ParentID string   `json:"parent_id,omitempty"`
 	DeviceID string   `json:"device_id"`
 	Features []string `json:"features"`
+	// Grants name concrete resource/operation permissions. Restrictions can
+	// suspend part of a grant for an interval without revoking the whole
+	// license; features remain the coarser legacy scope.
+	Grants []Grant `json:"grants,omitempty"`
 	// Delegators are temporary ed25519 keys the holder may use to create
 	// restricted sublicenses. They are covered by the envelope signature,
 	// so nobody can smuggle in an unauthorized delegation key.
@@ -35,6 +39,13 @@ type License struct {
 type DelegationKey struct {
 	KeyID string `json:"key_id"`
 	Key   []byte `json:"key"`
+}
+
+// Grant is one resource and the operations allowed on it. Wildcard "*"
+// means every resource or every operation in the context where it appears.
+type Grant struct {
+	Resource string   `json:"resource"`
+	Actions  []string `json:"actions"`
 }
 
 // Envelope is the serialized, imported license form: claims plus the issuer

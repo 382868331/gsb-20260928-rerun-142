@@ -34,6 +34,12 @@ func main() {
 		err = cmdRevoke(os.Args[2:])
 	case "revoke-import":
 		err = cmdRevokeImport(os.Args[2:])
+	case "restriction-sign":
+		err = cmdRestrictionSign(os.Args[2:])
+	case "restriction-import":
+		err = cmdRestrictionImport(os.Args[2:])
+	case "review-usage":
+		err = cmdReviewUsage(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	default:
@@ -61,8 +67,16 @@ commands:
   revoke      --secret FILE --out FILE --ids license1,license2 [--merge FILE]
               [--serial N]
   revoke-import --keyring FILE --store FILE --revocations FILE
+  restriction-sign --secret FILE --out FILE --serial N [--merge FILE]
+              --event-id ID --event-type suspend|cancel|end
+              [--target ID] [--scope-license ID] [--resource docs]
+              [--actions read,write] [--at RFC3339] [--not-before RFC3339]
+              [--not-after RFC3339] [--canceled-at RFC3339] [--ended-at RFC3339]
+  restriction-import --keyring FILE --store FILE --restrictions FILE
+  review-usage --license root,...,leaf --restriction-store FILE --records FILE
   check       --keyring FILE --license FILE --device ID --anchor FILE
               [--revocations FILE | --revocation-store FILE]
+              [--restrictions FILE | --restriction-store FILE]
               [--require-revocation]
               (--license accepts a comma-separated root-to-leaf chain)`)
 }
@@ -120,6 +134,7 @@ func cmdIssue(args []string) error {
 	id := fs.String("license-id", "", "unique license id")
 	device := fs.String("device", "", "bound device id")
 	feats := fs.String("features", "", "comma-separated feature names")
+	grantsFlag := fs.String("grants", "", "comma-separated resource=action,... grants")
 	days := fs.Int("days", 365, "validity in days")
 	at := fs.String("at", "", "issued-at time (RFC3339), default now")
 	delegatorPath := fs.String("delegator-key", "", "temporary delegator public key to embed")
@@ -151,6 +166,7 @@ func cmdIssue(args []string) error {
 		LicenseID: *id,
 		DeviceID:  *device,
 		Features:  features,
+		Grants:    parseGrants(*grantsFlag),
 		IssuedAt:  now.UTC().Format(time.RFC3339),
 		NotBefore: now.UTC().Format(time.RFC3339),
 		NotAfter:  now.AddDate(0, 0, *days).UTC().Format(time.RFC3339),
@@ -212,6 +228,7 @@ func cmdIssueDelegated(args []string) error {
 	id := fs.String("license-id", "", "unique sublicense id")
 	device := fs.String("device", "", "bound device id (must equal parent's)")
 	feats := fs.String("features", "", "comma-separated feature names (subset of parent)")
+	grantsFlag := fs.String("grants", "", "comma-separated resource=action,... grants (subset of parent)")
 	days := fs.Int("days", 365, "validity in days (must fit inside parent window)")
 	at := fs.String("at", "", "issued-at time (RFC3339), default now")
 	delegatorPath := fs.String("delegator-key", "", "optional next-level delegator key to embed")
@@ -259,6 +276,7 @@ func cmdIssueDelegated(args []string) error {
 		LicenseID: *id,
 		DeviceID:  *device,
 		Features:  features,
+		Grants:    parseGrants(*grantsFlag),
 		IssuedAt:  now.UTC().Format(time.RFC3339),
 		NotBefore: now.UTC().Format(time.RFC3339),
 		NotAfter:  notAfter.Format(time.RFC3339),
@@ -377,6 +395,8 @@ func cmdCheck(args []string) error {
 	device := fs.String("device", "", "local device id")
 	revocPath := fs.String("revocations", "", "signed revocation list (optional)")
 	storePath := fs.String("revocation-store", "", "persistent monotonic revocation store (optional)")
+	restrictionPath := fs.String("restrictions", "", "signed restriction update (optional)")
+	restrictionStorePath := fs.String("restriction-store", "", "persistent restriction facts store (optional)")
 	requireRev := fs.Bool("require-revocation", false, "fail when revocation data is missing")
 	anchorPath := fs.String("anchor", "anchor.txt", "per-device monotonic time anchor")
 	if err := fs.Parse(args); err != nil {
@@ -421,6 +441,24 @@ func cmdCheck(args []string) error {
 		}
 		c.RevocationStore = store
 	}
+	if *restrictionPath != "" {
+		data, err := os.ReadFile(*restrictionPath)
+		if err != nil {
+			return err
+		}
+		r, err := license.ParseSignedRestrictionUpdate(data)
+		if err != nil {
+			return err
+		}
+		c.Restriction = r
+	}
+	if *restrictionStorePath != "" {
+		restrictionStore, err := license.LoadRestrictionStore(*restrictionStorePath)
+		if err != nil {
+			return err
+		}
+		c.RestrictionStore = restrictionStore
+	}
 	res, eff, err := c.CheckChain(chain, *device, last)
 	// Advance the monotonic anchor on EVERY evaluation, including expired
 	// ones: otherwise "expire, then roll the clock back" could resurrect the
@@ -428,10 +466,220 @@ func cmdCheck(args []string) error {
 	if advErr := anchor.Advance(eff); advErr != nil {
 		return advErr
 	}
-	fmt.Printf("valid=%v device=%q features=%v checked_at=%s clock_rolled_back=%v revocation=%s\n",
+	fmt.Printf("valid=%v device=%q features=%v grants=%v checked_at=%s clock_rolled_back=%v revocation=%s restriction_known=%v restriction_serial=%d active_restrictions=%v\n",
 		res.Valid, res.License.DeviceID, res.License.Features,
-		res.CheckedAt.Format(time.RFC3339), res.ClockRolledBack, res.Revocation)
+		res.AvailableGrants, res.CheckedAt.Format(time.RFC3339), res.ClockRolledBack, res.Revocation,
+		res.RestrictionBasis.Known, res.RestrictionBasis.Serial, activeRestrictionIDs(res.RestrictionBasis.Active))
 	return err
+}
+
+func cmdRestrictionSign(args []string) error {
+	fs := flag.NewFlagSet("restriction-sign", flag.ContinueOnError)
+	secretPath := fs.String("secret", "issuer.key.json", "issuer secret key")
+	out := fs.String("out", "restrictions.json", "signed restriction update output")
+	mergePath := fs.String("merge", "", "previous signed update whose events are retained")
+	serial := fs.Int64("serial", 0, "strictly increasing restriction data version")
+	eventID := fs.String("event-id", "", "new event id")
+	eventType := fs.String("event-type", "", "suspend, cancel, or end")
+	targetID := fs.String("target", "", "target suspension event id for cancel/end")
+	scopeLicense := fs.String("scope-license", "", "license id whose subtree is restricted (empty means chain-wide)")
+	resource := fs.String("resource", "", "restricted resource")
+	actionsFlag := fs.String("actions", "", "comma-separated restricted operations")
+	at := fs.String("at", "", "event record time (RFC3339), default now")
+	notBefore := fs.String("not-before", "", "suspension start")
+	notAfter := fs.String("not-after", "", "suspension end, exclusive")
+	canceledAt := fs.String("canceled-at", "", "time a not-yet-started suspension is canceled")
+	endedAt := fs.String("ended-at", "", "time an active suspension ends")
+	reason := fs.String("reason", "", "human-readable reason")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	secret, err := license.LoadSecret(*secretPath)
+	if err != nil {
+		return err
+	}
+	var events []license.RestrictionEvent
+	if *mergePath != "" {
+		old, err := loadRestrictions(*mergePath)
+		if err != nil {
+			return err
+		}
+		events = append(events, old.Update.Events...)
+	}
+	event := license.RestrictionEvent{
+		EventID:  *eventID,
+		Type:     *eventType,
+		TargetID: *targetID,
+		Scope: license.RestrictionScope{
+			LicenseID: *scopeLicense,
+			Resource:  *resource,
+			Actions:   parseCSV(*actionsFlag),
+		},
+		Reason: *reason,
+	}
+	if event.NotBefore, err = parseRFC3339OrZero(*notBefore); err != nil {
+		return err
+	}
+	if event.NotAfter, err = parseRFC3339OrZero(*notAfter); err != nil {
+		return err
+	}
+	if event.EndedAt, err = parseRFC3339OrZero(*endedAt); err != nil {
+		return err
+	}
+	if event.CanceledAt, err = parseRFC3339OrZero(*canceledAt); err != nil {
+		return err
+	}
+	events = append(events, event)
+	generated := time.Now().UTC()
+	if *at != "" {
+		generated, err = time.Parse(time.RFC3339, *at)
+		if err != nil {
+			return err
+		}
+	}
+	signed, err := license.SignRestrictionUpdate(secret, license.RestrictionUpdate{
+		Serial: *serial, GeneratedAt: generated, Events: events,
+	})
+	if err != nil {
+		return err
+	}
+	data, err := signed.Encode()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(*out, data, 0o644)
+}
+
+func cmdRestrictionImport(args []string) error {
+	fs := flag.NewFlagSet("restriction-import", flag.ContinueOnError)
+	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
+	storePath := fs.String("store", "restriction-store.json", "local restriction store")
+	restrictionPath := fs.String("restrictions", "", "signed restriction update")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ring, err := license.LoadKeyRing(*ringPath)
+	if err != nil {
+		return err
+	}
+	update, err := loadRestrictions(*restrictionPath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadRestrictionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	if err := store.Import(ring, update); err != nil {
+		return err
+	}
+	fmt.Printf("imported issuer=%s serial=%d events=%d\n", update.Update.IssuerID, update.Update.Serial, len(update.Update.Events))
+	return nil
+}
+
+func cmdReviewUsage(args []string) error {
+	fs := flag.NewFlagSet("review-usage", flag.ContinueOnError)
+	licensePath := fs.String("license", "", "comma-separated root-to-leaf chain")
+	storePath := fs.String("restriction-store", "restriction-store.json", "local restriction store")
+	recordsPath := fs.String("records", "", "JSON array of license.UsageRecord values")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	chain, err := loadChain(*licensePath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadRestrictionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(*recordsPath)
+	if err != nil {
+		return err
+	}
+	var records []license.UsageRecord
+	if err := jsonUnmarshal(data, &records); err != nil {
+		return err
+	}
+	findings := store.ReviewUsage(chain, records)
+	data, err = jsonMarshalIndent(findings)
+	if err != nil {
+		return err
+	}
+	_, err = os.Stdout.Write(append(data, '\n'))
+	return err
+}
+
+func loadRestrictions(path string) (*license.SignedRestrictionUpdate, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return license.ParseSignedRestrictionUpdate(data)
+}
+
+func loadChain(path string) ([]*license.Envelope, error) {
+	var chain []*license.Envelope
+	for _, part := range strings.Split(path, ",") {
+		data, err := os.ReadFile(strings.TrimSpace(part))
+		if err != nil {
+			return nil, err
+		}
+		env, err := license.ParseEnvelope(data)
+		if err != nil {
+			return nil, err
+		}
+		chain = append(chain, env)
+	}
+	if len(chain) == 0 {
+		return nil, license.ErrMalformedLicense
+	}
+	return chain, nil
+}
+
+func parseGrants(in string) []license.Grant {
+	byResource := map[string][]string{}
+	var order []string
+	for _, item := range parseCSV(in) {
+		parts := strings.SplitN(item, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if _, ok := byResource[parts[0]]; !ok {
+			order = append(order, parts[0])
+		}
+		byResource[parts[0]] = append(byResource[parts[0]], parts[1])
+	}
+	var grants []license.Grant
+	for _, resource := range order {
+		grants = append(grants, license.Grant{Resource: resource, Actions: dedupe(byResource[resource])})
+	}
+	return grants
+}
+
+func parseCSV(in string) []string {
+	var out []string
+	for _, item := range strings.Split(in, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func parseRFC3339OrZero(in string) (time.Time, error) {
+	if in == "" {
+		return time.Time{}, nil
+	}
+	return time.Parse(time.RFC3339, in)
+}
+
+func activeRestrictionIDs(events []license.RestrictionEvent) []string {
+	ids := make([]string, 0, len(events))
+	for _, event := range events {
+		ids = append(ids, event.EventID)
+	}
+	return ids
 }
 
 func dedupe(in []string) []string {

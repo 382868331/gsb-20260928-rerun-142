@@ -31,12 +31,14 @@ func (s RevocationState) String() string {
 // Result is returned by the single Check entry point shared by every
 // application consuming the core.
 type Result struct {
-	License         License
-	Valid           bool
-	CheckedAt       time.Time
-	ClockRolledBack bool
-	Revocation      RevocationState
-	Err             error
+	License          License
+	Valid            bool
+	CheckedAt        time.Time
+	ClockRolledBack  bool
+	Revocation       RevocationState
+	AvailableGrants  []Grant
+	RestrictionBasis RestrictionBasis
+	Err              error
 }
 
 // HasFeature reports whether the license grants the named feature.
@@ -57,8 +59,10 @@ type Checker struct {
 	// this device, keyed by issuer. It survives restarts and refuses to
 	// roll backwards. Revocation (below) remains for a single directly
 	// supplied list and takes precedence when set.
-	RevocationStore *RevocationStore
-	Revocation      *SignedRevocationList
+	RevocationStore  *RevocationStore
+	Revocation       *SignedRevocationList
+	RestrictionStore *RestrictionStore
+	Restriction      *SignedRestrictionUpdate
 	// RequireRevocation makes a missing list a hard failure. It is false by
 	// default: the caller instead sees RevocationUnknown and must not claim
 	// revocation was checked.
@@ -168,8 +172,33 @@ func (c *Checker) CheckChain(chain []*Envelope, deviceID string, lastAnchor time
 	}
 
 	leaf.License = chain[len(chain)-1].License
+	if err := c.applyRestrictions(&leaf, chain, eff); err != nil {
+		return &leaf, eff, err
+	}
 	leaf.Valid = true
 	return &leaf, eff, nil
+}
+
+func (c *Checker) applyRestrictions(result *Result, chain []*Envelope, at time.Time) error {
+	var events []RestrictionEvent
+	switch {
+	case c.Restriction != nil:
+		if err := c.Restriction.Verify(c.Ring); err != nil {
+			return err
+		}
+		events = c.Restriction.Update.Events
+		result.RestrictionBasis = RestrictionBasis{Known: true, Serial: c.Restriction.Update.Serial}
+	case c.RestrictionStore != nil:
+		update := c.RestrictionStore.UpdateForIssuer(chain[0].License.IssuerID)
+		if update != nil {
+			events = update.Update.Events
+			result.RestrictionBasis = RestrictionBasis{Known: true, Serial: update.Update.Serial}
+		}
+	}
+	active := activeRestrictionsForLicense(events, chain, at)
+	result.RestrictionBasis.Active = active
+	result.AvailableGrants = availableGrants(chain[len(chain)-1].License.Grants, active)
+	return nil
 }
 
 // verifyDelegationSignature checks the child envelope against a delegator

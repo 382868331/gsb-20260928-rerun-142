@@ -12,6 +12,12 @@
 - `license/revocation.go`：由签发者签名的撤销列表。
 - `license/revocation_store.go`：按签发者持久化的最新撤销状态；严格单调，
   更新是原子替换，中断/重开不改变信任边界。
+- `license/restriction.go`：签发者签名的局部停用事件（`suspend` /
+  `cancel` / `end`），按明确的资源、操作与半开生效区间表达。
+- `license/restriction_store.go`：离线接收者最近确认的限制事实；更新严格
+  递增、事件不可删除或改写，保存重开后继续以同一组事实求当前可用范围。
+- `license/restriction_eval.go`：交叉区间、授权链继承、当前可用授权与历史
+  使用记录复核。
 - `license/delegate.go`：受限转授（子授权）签发与范围约束校验。
 - `license/clock_anchor.go`：系统时间倒退的明确处理规则与持久化锚点。
 - `license/checker.go`：统一检查入口 `Checker.Check` / `Checker.CheckChain`。
@@ -47,6 +53,16 @@
    `ErrStaleRevocationData`，状态不变；新列表必须累积包含此前已撤销的 ID，漏掉
    一个也按回退处理；先写临时文件再原子改名，更新中断后重开仍是旧的已信任状态。
    “资料缺失”与“已检查通过”继续严格区分（三态结果不变）。
+10. **局部停用而非整证撤销**：`suspend` 只停用明确的 `resource/actions`，
+    授权仍保持有效，`Result.AvailableGrants` 给出剩余可执行操作；区间为
+    `[not_before, not_after)`，可交叉叠加。`cancel` 只能取消尚未开始的停用；
+    `end` 结束正在生效的停用并保留已发生区间，两者是不同事件，不能互相改写。
+11. **层级转授只能收窄**：子授权的资源/操作必须包含在父授权中；祖先已停用
+    的资源操作会沿授权链继续作用于后代，后代不能通过重新转授把它恢复。
+12. **离线事实与历史复核**：离线期间继续使用最近确认的限制资料；新资料到达
+    后，只把“当时使用了旧依据、且与后来确认的已发生区间相交”的记录列为复核。
+    系统不会把新限制伪装成当时已经生效，也不会改写旧验证结论。每次检查结果都
+    带 `RestrictionBasis.Serial` 与当次生效事件 ID，可追溯采用的是哪组事实。
 
 ## 命令行用法（全部离线）
 
@@ -55,7 +71,7 @@ go build ./cmd/license-tool
 
 ./license-tool init-issuer --issuer local-issuer      # 生成临时密钥与公钥环
 ./license-tool issue --license-id L1 --device DEV-X \
-  --features print,scan --days 30 --out lic.json
+  --features print,scan --grants docs=read,docs=write --days 30 --out lic.json
 ./license-tool rotate --issuer local-issuer           # 轮换（保留旧公钥）
 ./license-tool gen-delegator --key dk1.key.json        # 临时转授密钥
 ./license-tool issue ... --delegator-key dk1.key.json  # 父授权内嵌转授公钥
@@ -65,11 +81,27 @@ go build ./cmd/license-tool
 ./license-tool revoke --ids L1 --serial 3 --out rev3.json
 ./license-tool revoke-import --keyring keyring.json \
   --store rev-store.json --revocations rev3.json       # 旧 serial 拒绝、不回退
+./license-tool restriction-sign --secret iss.key.json --serial 1 \
+  --event-id block-write --event-type suspend --scope-license L1 \
+  --resource docs --actions write \
+  --not-before 2026-09-05T00:00:00Z --not-after 2026-09-10T00:00:00Z \
+  --out rest1.json
+# 尚未开始：cancel --canceled-at；已经生效后：end --ended-at
+./license-tool restriction-sign --secret iss.key.json --merge rest1.json --serial 2 \
+  --event-id close-block --event-type end --target block-write \
+  --ended-at 2026-09-07T00:00:00Z \
+  --out rest2.json
+./license-tool restriction-import --keyring keyring.json \
+  --store restriction-store.json --restrictions rest2.json
+./license-tool review-usage --license root.json,sub.json,leaf.json \
+  --restriction-store restriction-store.json --records usage.json
 ./license-tool check --license lic.json --device DEV-X \
-  --anchor anchor.txt [--revocation-store rev-store.json] [--require-revocation]
+  --anchor anchor.txt [--revocation-store rev-store.json] \
+  [--restriction-store restriction-store.json] [--require-revocation]
 # 多层转授：--license 传“根,...,叶”逗号分隔的授权链
 ./license-tool check --license root.json,sub.json,leaf.json --device DEV-X \
-  --anchor anchor.txt --revocation-store rev-store.json
+  --anchor anchor.txt --revocation-store rev-store.json \
+  --restriction-store restriction-store.json
 ```
 
 ## 应用集成
@@ -80,8 +112,12 @@ go build ./cmd/license-tool
 ring, _ := license.LoadKeyRing("keyring.json")
 store, _ := license.LoadRevocationStore("rev-store.json")
 _ = store.Import(ring, signedList) // 旧 serial 或丢失已撤销 ID 返回 ErrStaleRevocationData
-checker := &license.Checker{Ring: ring, RevocationStore: store}
+restrictionStore, _ := license.LoadRestrictionStore("restriction-store.json")
+checker := &license.Checker{Ring: ring, RevocationStore: store, RestrictionStore: restrictionStore}
 result, effectiveAt, err := checker.CheckChain(chain, localDeviceID, lastAnchor)
+_ = result.HasGrant("docs", "write")                  // 当前是否仍可执行
+_ = result.RestrictionBasis.Serial                    // 本次采用的事实编号
+_ = restrictionStore.ReviewUsage(chain, usageRecords) // 新资料后的复核清单
 ```
 
 ## 测试
@@ -94,4 +130,5 @@ go test ./...
 转授密钥断链、父授权过期与被撤销对子授权的明确影响、签发者轮换叠加时钟回拨、
 撤销资料旧 serial 与撤销 ID 丢失的回退拒绝、更新中断与保存重开后信任边界不变、
 功能项与有效期及设备身份篡改、损坏授权、虚构设备绑定、版本变更、撤销列表损坏/
-资料缺失（三态）。
+资料缺失（三态）、局部停用交叉区间、祖先限制继承、取消未开始与结束生效的不同记录、
+离线旧依据下的使用复核、限制资料保存重开与时钟回退后的当前范围一致性。

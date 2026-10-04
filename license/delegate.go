@@ -71,6 +71,9 @@ func ValidateDelegation(parent, child *License) error {
 			return ErrDelegationWidensScope
 		}
 	}
+	if err := validateGrantNarrowing(parent.Grants, child.Grants); err != nil {
+		return err
+	}
 	pnbf, err1 := time.Parse(time.RFC3339, parent.NotBefore)
 	pnbt, err2 := time.Parse(time.RFC3339, parent.NotAfter)
 	cnbf, err3 := time.Parse(time.RFC3339, child.NotBefore)
@@ -80,6 +83,29 @@ func ValidateDelegation(parent, child *License) error {
 	}
 	if cnbf.Before(pnbf) || cnbt.After(pnbt) || cnbt.Before(cnbf) {
 		return ErrDelegationWidensScope
+	}
+	return nil
+}
+
+func validateGrantNarrowing(parentGrants, childGrants []Grant) error {
+	for _, childGrant := range childGrants {
+		var parentActions []string
+		for _, parentGrant := range parentGrants {
+			if parentGrant.Resource == "*" || parentGrant.Resource == childGrant.Resource || childGrant.Resource == "*" && parentGrant.Resource == "*" {
+				if parentGrant.Resource != "*" && childGrant.Resource == "*" {
+					return ErrDelegationWidensScope
+				}
+				parentActions = append(parentActions, parentGrant.Actions...)
+			}
+		}
+		if len(parentActions) == 0 {
+			return ErrDelegationWidensScope
+		}
+		for _, action := range childGrant.Actions {
+			if !actionsContain(parentActions, action) {
+				return ErrDelegationWidensScope
+			}
+		}
 	}
 	return nil
 }

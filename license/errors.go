@@ -19,4 +19,8 @@ var (
 	ErrChainBroken             = errors.New("license: delegation chain is broken")
 	ErrDelegationWidensScope   = errors.New("license: sublicense broadens the parent's scope")
 	ErrParentInvalid           = errors.New("license: parent authorization is invalid, so the sublicense is invalid")
+	ErrMalformedRestriction    = errors.New("license: malformed restriction update")
+	ErrStaleRestrictionData    = errors.New("license: restriction data is older than the state already known")
+	ErrRestrictionStore        = errors.New("license: local restriction store is unreadable or corrupt")
+	ErrRestrictionConflict     = errors.New("license: restriction event conflicts with an existing event")
 )

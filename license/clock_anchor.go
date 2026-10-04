@@ -2,6 +2,7 @@ package license
 
 import (
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -47,7 +48,7 @@ func (a *FileAnchor) Last() (time.Time, error) {
 	if err != nil {
 		return time.Time{}, err
 	}
-	return time.Parse(time.RFC3339Nano, string(data))
+	return time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
 }
 
 func (a *FileAnchor) Advance(t time.Time) error {
