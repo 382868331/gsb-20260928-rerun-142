@@ -60,7 +60,11 @@
 11. **取消与结束是不同记录**：`cancel-scheduled` 只能取消尚未开始的停用
     （按列表 `generated_at` 判定），把它整个抹去；`end-early` 只能作用于已
     开始的停用，把生效区间截断到 `ended_at`。两种记录混用会被拒绝
-    （`ErrInvalidSuspensionRecord`），不会被静默 reinterpret。
+    （`ErrInvalidSuspensionRecord`），不会被静默 reinterpret。判定时刻是记录
+    **首次出现**的那份列表的 `generated_at`：已确认的取消/结束记录被后续
+    累计列表原样携带时，即使跨过原定生效时间也仍然有效，不会因新列表的
+    生成时间而失效；首次提交就已迟到的取消依旧被拒绝，借用旧记录名但内容
+    不同的记录按新记录重新判定，不能绕过验证。
 12. **离线限制依据与复核**：接收者离线期间以本地单调存储中最近确认的停用
     列表为限制依据；取得更新（`serial` 严格递增、记录累积）后，用
     `SuspensionStore.Review` / `ReviewUsage` 重新说明哪些已有使用记录需要

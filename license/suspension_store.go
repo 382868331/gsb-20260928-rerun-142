@@ -56,14 +56,21 @@ func (s *SuspensionStore) Import(kr *KeyRing, list *SignedSuspensionList) error 
 	if err := list.Verify(kr); err != nil {
 		return err
 	}
-	if err := validateSuspensionList(&list.List); err != nil {
-		return err
-	}
 	id := list.List.IssuerID
 	cur := s.states[id]
 	if cur != nil && list.List.Serial <= cur.Serial {
 		return fmt.Errorf("%w: issuer=%s known_serial=%d incoming_serial=%d",
 			ErrStaleSuspensionData, id, cur.Serial, list.List.Serial)
+	}
+	// Cancel/end records carried over from the confirmed list keep the
+	// decision instant of that list; only genuinely new records are judged
+	// against the incoming list's GeneratedAt.
+	var prev *SuspensionList
+	if cur != nil {
+		prev = &cur.Latest.List
+	}
+	if err := validateSuspensionList(&list.List, prev); err != nil {
+		return err
 	}
 	// Records are cumulative: a newer list that drops a previously
 	// confirmed record would silently lift a restriction, which is a

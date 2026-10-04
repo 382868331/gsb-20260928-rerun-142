@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 )
 
@@ -99,14 +100,46 @@ func (s *SignedSuspensionList) Verify(kr *KeyRing) error {
 	return nil
 }
 
-// validateSuspensionList enforces structural and kind rules. The list's
-// GeneratedAt is the decision instant: cancel-scheduled is only legal for
-// suspensions that have not started yet, end-early only for ones that
-// have. Mixing them up is rejected instead of silently reinterpreted.
-func validateSuspensionList(l *SuspensionList) error {
+// sameSuspensionRecord reports whether two records are identical, so a
+// record carried over from a previously confirmed list can be recognized.
+func sameSuspensionRecord(a, b SuspensionRecord) bool {
+	return a.RecordID == b.RecordID &&
+		a.Kind == b.Kind &&
+		a.LicenseID == b.LicenseID &&
+		slices.Equal(a.Features, b.Features) &&
+		slices.Equal(a.Operations, b.Operations) &&
+		a.NotBefore == b.NotBefore &&
+		a.NotAfter == b.NotAfter &&
+		a.TargetRecordID == b.TargetRecordID &&
+		a.EndedAt == b.EndedAt
+}
+
+// validateSuspensionList enforces structural and kind rules. The decision
+// instant for cancel-scheduled / end-early records is the GeneratedAt of
+// the list in which the record FIRST appeared: a cancellation that was
+// confirmed while the suspension had not started yet stays confirmed when
+// later cumulative lists carry it forward, even after the original
+// effective time has passed. prev is the previously confirmed list (nil
+// when none exists); a record identical to an already confirmed one is a
+// settled fact and is not re-judged against the new list's GeneratedAt,
+// while a brand-new (or altered) record is always judged against it, so a
+// late cancellation cannot borrow an old record name to bypass validation.
+func validateSuspensionList(l *SuspensionList, prev *SuspensionList) error {
 	gen, err := time.Parse(time.RFC3339, l.GeneratedAt)
 	if err != nil {
 		return fmt.Errorf("%w: bad generated_at", ErrMalformedSuspensionList)
+	}
+	prevRecords := map[string]SuspensionRecord{}
+	if prev != nil {
+		for _, r := range prev.Records {
+			prevRecords[r.RecordID] = r
+		}
+	}
+	// carriedOver reports whether the record is identical to an already
+	// confirmed one; its timing was validated when it first appeared.
+	carriedOver := func(r SuspensionRecord) bool {
+		old, ok := prevRecords[r.RecordID]
+		return ok && sameSuspensionRecord(old, r)
 	}
 	seen := map[string]bool{}
 	suspends := map[string]SuspensionRecord{}
@@ -136,7 +169,7 @@ func validateSuspensionList(l *SuspensionList) error {
 				return fmt.Errorf("%w: cancel %q targets unknown record", ErrInvalidSuspensionRecord, r.RecordID)
 			}
 			nbf, _ := time.Parse(time.RFC3339, tgt.NotBefore)
-			if !nbf.After(gen) {
+			if !carriedOver(r) && !nbf.After(gen) {
 				return fmt.Errorf("%w: cancel %q targets a suspension that already started; use end-early",
 					ErrInvalidSuspensionRecord, r.RecordID)
 			}
@@ -151,7 +184,7 @@ func validateSuspensionList(l *SuspensionList) error {
 			if err != nil {
 				return fmt.Errorf("%w: end %q has a bad ended_at", ErrInvalidSuspensionRecord, r.RecordID)
 			}
-			if nbf.After(gen) {
+			if !carriedOver(r) && nbf.After(gen) {
 				return fmt.Errorf("%w: end %q targets a suspension that has not started; use cancel-scheduled",
 					ErrInvalidSuspensionRecord, r.RecordID)
 			}
