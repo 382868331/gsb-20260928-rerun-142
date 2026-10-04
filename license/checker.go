@@ -36,7 +36,19 @@ type Result struct {
 	CheckedAt       time.Time
 	ClockRolledBack bool
 	Revocation      RevocationState
-	Err             error
+	// Restrictions are the confirmed restriction facts that were ACTIVE at
+	// the evaluation time and applied to this chain. Every check reports
+	// exactly which facts it used.
+	Restrictions []RestrictionFact
+	// SuspendedFeatures are leaf features currently suspended; the rest
+	// of the license keeps working (partial suspension, not revocation).
+	SuspendedFeatures []string
+	EffectiveFeatures []string
+	// SuspensionsKnown is false when no signed suspension data for the
+	// root issuer was available; the restriction basis is then unknown
+	// rather than "no restrictions".
+	SuspensionsKnown bool
+	Err              error
 }
 
 // HasFeature reports whether the license grants the named feature.
@@ -47,6 +59,35 @@ func (r *Result) HasFeature(name string) bool {
 		}
 	}
 	return false
+}
+
+// FeatureAvailable reports whether the feature is granted AND not
+// currently suspended by a confirmed restriction fact.
+func (r *Result) FeatureAvailable(name string) bool {
+	if !r.HasFeature(name) {
+		return false
+	}
+	for _, f := range r.SuspendedFeatures {
+		if f == name {
+			return false
+		}
+	}
+	return true
+}
+
+// OperationAvailable reports whether (feature, operation) is usable:
+// the feature must be available and no active restriction fact may cover
+// the pair.
+func (r *Result) OperationAvailable(feature, operation string) bool {
+	if !r.FeatureAvailable(feature) {
+		return false
+	}
+	for _, f := range r.Restrictions {
+		if f.covers(feature, operation) {
+			return false
+		}
+	}
+	return true
 }
 
 // Checker verifies imported licenses against a trusted ring.
@@ -63,6 +104,11 @@ type Checker struct {
 	// default: the caller instead sees RevocationUnknown and must not claim
 	// revocation was checked.
 	RequireRevocation bool
+	// SuspensionStore holds the newest confirmed suspension data per
+	// issuer. Suspensions (below) is a single directly supplied list and
+	// takes precedence when set.
+	SuspensionStore *SuspensionStore
+	Suspensions     *SignedSuspensionList
 }
 
 // CheckChain verifies a delegation chain ordered root-first, leaf-last.
@@ -168,8 +214,68 @@ func (c *Checker) CheckChain(chain []*Envelope, deviceID string, lastAnchor time
 	}
 
 	leaf.License = chain[len(chain)-1].License
+	c.applySuspensions(chain, &leaf, eff)
 	leaf.Valid = true
 	return &leaf, eff, nil
+}
+
+// applySuspensions resolves the confirmed suspension basis for every
+// chain member and computes the leaf's currently usable scope. A
+// suspension recorded against ANY ancestor narrows the leaf: descendants
+// can only ever restrict further and can never use re-delegation to
+// restore scope an ancestor has suspended. Evaluation uses the effective
+// (rollback-protected) time, so turning the clock back cannot escape an
+// active suspension.
+func (c *Checker) applySuspensions(chain []*Envelope, leaf *Result, eff time.Time) {
+	issuer := chain[0].License.IssuerID
+	known := false
+	var facts []RestrictionFact
+	for _, env := range chain {
+		fs, ok := c.suspensionFacts(issuer, env.License.LicenseID)
+		if ok {
+			known = true
+		}
+		for _, f := range fs {
+			if f.activeAt(eff) {
+				facts = append(facts, f)
+			}
+		}
+	}
+	leaf.SuspensionsKnown = known
+	leaf.Restrictions = facts
+	suspended := map[string]bool{}
+	for _, f := range facts {
+		for _, feat := range leaf.License.Features {
+			if f.covers(feat, "") {
+				suspended[feat] = true
+			}
+		}
+	}
+	for _, feat := range leaf.License.Features {
+		if suspended[feat] {
+			leaf.SuspendedFeatures = append(leaf.SuspendedFeatures, feat)
+		} else {
+			leaf.EffectiveFeatures = append(leaf.EffectiveFeatures, feat)
+		}
+	}
+}
+
+// suspensionFacts resolves the confirmed facts for one license, preferring
+// a directly supplied list over the persistent store.
+func (c *Checker) suspensionFacts(issuerID, licenseID string) ([]RestrictionFact, bool) {
+	if c.Suspensions != nil {
+		if err := c.Suspensions.Verify(c.Ring); err != nil {
+			return nil, false
+		}
+		if c.Suspensions.List.IssuerID != issuerID {
+			return nil, false
+		}
+		return resolveFacts(&c.Suspensions.List, licenseID), true
+	}
+	if c.SuspensionStore != nil {
+		return c.SuspensionStore.Facts(issuerID, licenseID)
+	}
+	return nil, false
 }
 
 // verifyDelegationSignature checks the child envelope against a delegator

@@ -34,6 +34,12 @@ func main() {
 		err = cmdRevoke(os.Args[2:])
 	case "revoke-import":
 		err = cmdRevokeImport(os.Args[2:])
+	case "suspend":
+		err = cmdSuspend(os.Args[2:])
+	case "suspend-import":
+		err = cmdSuspendImport(os.Args[2:])
+	case "usage-review":
+		err = cmdUsageReview(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	default:
@@ -61,8 +67,18 @@ commands:
   revoke      --secret FILE --out FILE --ids license1,license2 [--merge FILE]
               [--serial N]
   revoke-import --keyring FILE --store FILE --revocations FILE
+  suspend     --secret FILE --out FILE --records FILE [--merge FILE]
+              [--serial N] [--at RFC3339]
+              (records file: JSON array of suspension records; kinds:
+               suspend / cancel-scheduled / end-early)
+  suspend-import --keyring FILE --store FILE --suspensions FILE
+  usage-review --store FILE --usage FILE
+              (usage file: JSON array of records with license_id, feature,
+               operation, time; prints which past usages need review
+               under the currently confirmed restriction basis)
   check       --keyring FILE --license FILE --device ID --anchor FILE
               [--revocations FILE | --revocation-store FILE]
+              [--suspensions FILE | --suspension-store FILE]
               [--require-revocation]
               (--license accepts a comma-separated root-to-leaf chain)`)
 }
@@ -370,6 +386,147 @@ func cmdRevokeImport(args []string) error {
 	return nil
 }
 
+func cmdSuspend(args []string) error {
+	fs := flag.NewFlagSet("suspend", flag.ContinueOnError)
+	secretPath := fs.String("secret", "issuer.key.json", "issuer secret key")
+	out := fs.String("out", "suspensions.json", "signed suspension list output")
+	recordsPath := fs.String("records", "", "JSON array of suspension records")
+	merge := fs.String("merge", "", "existing list whose records are retained")
+	serial := fs.Int64("serial", 0, "strictly increasing suspension data version")
+	at := fs.String("at", "", "generated-at time (RFC3339), default now")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *recordsPath == "" && *merge == "" {
+		return fmt.Errorf("--records and/or --merge are required")
+	}
+	secret, err := license.LoadSecret(*secretPath)
+	if err != nil {
+		return err
+	}
+	gen := time.Now().UTC()
+	if *at != "" {
+		gen, err = time.Parse(time.RFC3339, *at)
+		if err != nil {
+			return err
+		}
+	}
+	var records []license.SuspensionRecord
+	if *merge != "" {
+		old, err := loadSuspensions(*merge)
+		if err != nil {
+			return err
+		}
+		records = append(records, old.List.Records...)
+	}
+	if *recordsPath != "" {
+		data, err := os.ReadFile(*recordsPath)
+		if err != nil {
+			return err
+		}
+		var extra []license.SuspensionRecord
+		if err := jsonUnmarshal(data, &extra); err != nil {
+			return err
+		}
+		records = append(records, extra...)
+	}
+	signed, err := license.SignSuspensionList(secret, license.SuspensionList{
+		Serial:      *serial,
+		GeneratedAt: gen.Format(time.RFC3339),
+		Records:     records,
+	})
+	if err != nil {
+		return err
+	}
+	data, err := signed.Encode()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(*out, data, 0o644)
+}
+
+func loadSuspensions(path string) (*license.SignedSuspensionList, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var s license.SignedSuspensionList
+	if err := jsonUnmarshal(data, &s); err != nil {
+		return nil, license.ErrMalformedSuspensionList
+	}
+	return &s, nil
+}
+
+func cmdSuspendImport(args []string) error {
+	// Verifies the signed list and applies it only when strictly newer;
+	// stale or non-cumulative data is rejected and changes nothing.
+	fs := flag.NewFlagSet("suspend-import", flag.ContinueOnError)
+	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
+	storePath := fs.String("store", "suspension-store.json", "local suspension state store")
+	suspPath := fs.String("suspensions", "", "signed suspension list to import")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *suspPath == "" {
+		return fmt.Errorf("--suspensions is required")
+	}
+	ring, err := license.LoadKeyRing(*ringPath)
+	if err != nil {
+		return err
+	}
+	list, err := loadSuspensions(*suspPath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadSuspensionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	if err := store.Import(ring, list); err != nil {
+		return err
+	}
+	fmt.Printf("imported issuer=%s serial=%d records=%d\n",
+		list.List.IssuerID, list.List.Serial, len(list.List.Records))
+	return nil
+}
+
+func cmdUsageReview(args []string) error {
+	// Re-states, against the newest confirmed basis, which existing usage
+	// records need review. A usage is flagged only when it falls inside a
+	// fact's effective interval; later-effective restrictions never reach
+	// back and rewrite earlier usage.
+	fs := flag.NewFlagSet("usage-review", flag.ContinueOnError)
+	storePath := fs.String("store", "suspension-store.json", "local suspension state store")
+	usagePath := fs.String("usage", "", "JSON array of usage records")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *usagePath == "" {
+		return fmt.Errorf("--usage is required")
+	}
+	store, err := license.LoadSuspensionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(*usagePath)
+	if err != nil {
+		return err
+	}
+	var usages []license.UsageRecord
+	if err := jsonUnmarshal(data, &usages); err != nil {
+		return err
+	}
+	items := store.Review(usages)
+	for _, it := range items {
+		fmt.Printf("review license=%s feature=%s operation=%s used_at=%s fact=%s serial=%d interval=%s..%s\n",
+			it.Usage.LicenseID, it.Usage.Feature, it.Usage.Operation,
+			it.Usage.Time.UTC().Format(time.RFC3339),
+			it.Fact.RecordID, it.Fact.Serial, it.Fact.NotBefore, it.Fact.NotAfter)
+	}
+	fmt.Printf("review_items=%d\n", len(items))
+	return nil
+}
+
 func cmdCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
@@ -377,6 +534,8 @@ func cmdCheck(args []string) error {
 	device := fs.String("device", "", "local device id")
 	revocPath := fs.String("revocations", "", "signed revocation list (optional)")
 	storePath := fs.String("revocation-store", "", "persistent monotonic revocation store (optional)")
+	suspPath := fs.String("suspensions", "", "signed suspension list (optional)")
+	suspStorePath := fs.String("suspension-store", "", "persistent monotonic suspension store (optional)")
 	requireRev := fs.Bool("require-revocation", false, "fail when revocation data is missing")
 	anchorPath := fs.String("anchor", "anchor.txt", "per-device monotonic time anchor")
 	if err := fs.Parse(args); err != nil {
@@ -421,6 +580,20 @@ func cmdCheck(args []string) error {
 		}
 		c.RevocationStore = store
 	}
+	if *suspPath != "" {
+		s, err := loadSuspensions(*suspPath)
+		if err != nil {
+			return err
+		}
+		c.Suspensions = s
+	}
+	if *suspStorePath != "" {
+		store, err := license.LoadSuspensionStore(*suspStorePath)
+		if err != nil {
+			return err
+		}
+		c.SuspensionStore = store
+	}
 	res, eff, err := c.CheckChain(chain, *device, last)
 	// Advance the monotonic anchor on EVERY evaluation, including expired
 	// ones: otherwise "expire, then roll the clock back" could resurrect the
@@ -428,9 +601,14 @@ func cmdCheck(args []string) error {
 	if advErr := anchor.Advance(eff); advErr != nil {
 		return advErr
 	}
-	fmt.Printf("valid=%v device=%q features=%v checked_at=%s clock_rolled_back=%v revocation=%s\n",
+	fmt.Printf("valid=%v device=%q features=%v effective_features=%v suspended=%v checked_at=%s clock_rolled_back=%v revocation=%s suspensions_known=%v\n",
 		res.Valid, res.License.DeviceID, res.License.Features,
-		res.CheckedAt.Format(time.RFC3339), res.ClockRolledBack, res.Revocation)
+		res.EffectiveFeatures, res.SuspendedFeatures,
+		res.CheckedAt.Format(time.RFC3339), res.ClockRolledBack, res.Revocation, res.SuspensionsKnown)
+	for _, f := range res.Restrictions {
+		fmt.Printf("restriction record=%s serial=%d license=%s features=%v operations=%v interval=%s..%s\n",
+			f.RecordID, f.Serial, f.LicenseID, f.Features, f.Operations, f.NotBefore, f.NotAfter)
+	}
 	return err
 }
 

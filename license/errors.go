@@ -19,4 +19,8 @@ var (
 	ErrChainBroken             = errors.New("license: delegation chain is broken")
 	ErrDelegationWidensScope   = errors.New("license: sublicense broadens the parent's scope")
 	ErrParentInvalid           = errors.New("license: parent authorization is invalid, so the sublicense is invalid")
+	ErrMalformedSuspensionList = errors.New("license: malformed suspension list")
+	ErrInvalidSuspensionRecord = errors.New("license: invalid suspension record")
+	ErrStaleSuspensionData     = errors.New("license: suspension data is older than the state already known")
+	ErrSuspensionStore         = errors.New("license: local suspension store is unreadable or corrupt")
 )
