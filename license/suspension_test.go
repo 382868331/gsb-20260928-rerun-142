@@ -3,6 +3,7 @@ package license
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -191,6 +192,117 @@ func TestCancelScheduledAndEndEarlyAreDistinct(t *testing.T) {
 		SuspensionRecord{RecordID: "E2", Kind: EndEarly, TargetRecordID: "S4", EndedAt: rfc(day(12))})
 	if err := store.Import(ring, badEnd); !errors.Is(err, ErrInvalidSuspensionRecord) {
 		t.Fatalf("end of a not-yet-started suspension: %v", err)
+	}
+}
+
+func TestHistoricalCancelKeepsOriginalDecisionTime(t *testing.T) {
+	key, _ := NewIssuerKey("iss", "k1")
+	ring := NewKeyRing(key.IssuerPublic)
+	path := filepath.Join(t.TempDir(), "susp-store.json")
+	store, _ := LoadSuspensionStore(path)
+
+	scheduled := suspendRecord("S1", "lic-1", []string{"scan"}, nil, day(10), day(20))
+	cancel := SuspensionRecord{RecordID: "C1", Kind: CancelScheduled, TargetRecordID: "S1"}
+
+	if err := store.Import(ring, signSuspensions(t, key, 1, day(5), scheduled)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Import(ring, signSuspensions(t, key, 2, day(8), scheduled, cancel)); err != nil {
+		t.Fatalf("cancellation confirmed before start must be accepted: %v", err)
+	}
+
+	// A different cancellation first presented after the target started is
+	// still late. Its signed record id cannot be borrowed from the old fact.
+	lateCancel := SuspensionRecord{RecordID: "C2", Kind: CancelScheduled, TargetRecordID: "S1"}
+	if err := store.Import(ring, signSuspensions(t, key, 3, day(15), scheduled, cancel, lateCancel)); !errors.Is(err, ErrInvalidSuspensionRecord) {
+		t.Fatalf("late first cancellation must be rejected: %v", err)
+	} else if !strings.Contains(err.Error(), "C2") || !strings.Contains(err.Error(), "S1") {
+		t.Fatalf("rejection must name the cancel fact and target: %v", err)
+	}
+	if store.Serial("iss") != 2 {
+		t.Fatalf("rejected update must retain serial 2, got %d", store.Serial("iss"))
+	}
+
+	// Re-serializing the already confirmed cancellation into a list generated
+	// after the suspension would have started must not invalidate that fact.
+	if err := store.Import(ring, signSuspensions(t, key, 4, day(15), scheduled, cancel)); err != nil {
+		t.Fatalf("historical cancellation must retain its original decision time: %v", err)
+	}
+
+	// Reusing the confirmed cancellation record id with changed content is an
+	// attempted rollback, not evidence that the new target was cancelled.
+	otherScheduled := suspendRecord("S2", "lic-1", []string{"print"}, nil, day(20), day(25))
+	mutatedCancel := cancel
+	mutatedCancel.TargetRecordID = "S2"
+	if err := store.Import(ring, signSuspensions(t, key, 5, day(22), scheduled, cancel, otherScheduled, mutatedCancel)); !errors.Is(err, ErrInvalidSuspensionRecord) {
+		t.Fatalf("mutating confirmed record %q must be rejected: %v", cancel.RecordID, err)
+	}
+
+	store, err := LoadSuspensionStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.Serial("iss") != 4 {
+		t.Fatalf("reopen must retain last trusted serial 4, got %d", store.Serial("iss"))
+	}
+	usages := []UsageRecord{
+		{LicenseID: "lic-1", Feature: "scan", Operation: "run", Time: day(15)},
+		{LicenseID: "lic-1", Feature: "print", Operation: "run", Time: day(22)},
+	}
+	if items := store.Review(usages); len(items) != 0 {
+		t.Fatalf("cancelled and rejected future facts must not review usage: %+v", items)
+	}
+}
+
+func TestCumulativeCancelAndEndEarlyPreserveOperationsAcrossReopen(t *testing.T) {
+	key, _ := NewIssuerKey("iss", "k1")
+	ring := NewKeyRing(key.IssuerPublic)
+	path := filepath.Join(t.TempDir(), "susp-store.json")
+	store, _ := LoadSuspensionStore(path)
+	env := testLicense(t, key, fictionalDeviceA, suspensionBase, day(40))
+
+	scheduled := suspendRecord("S1", "lic-1", []string{"scan"}, nil, day(10), day(20))
+	cancel := SuspensionRecord{RecordID: "C1", Kind: CancelScheduled, TargetRecordID: "S1"}
+	live := suspendRecord("S2", "lic-1", []string{"print"}, []string{"export"}, day(16), day(20))
+	end := SuspensionRecord{RecordID: "E1", Kind: EndEarly, TargetRecordID: "S2", EndedAt: rfc(day(17))}
+
+	if err := store.Import(ring, signSuspensions(t, key, 1, day(5), scheduled)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Import(ring, signSuspensions(t, key, 2, day(8), scheduled, cancel, live)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Import(ring, signSuspensions(t, key, 3, day(18), scheduled, cancel, live, end)); err != nil {
+		t.Fatal(err)
+	}
+
+	store, _ = LoadSuspensionStore(path)
+	checker := &Checker{Ring: ring, Clock: &fakeClock{day(16).Add(12 * time.Hour)}, SuspensionStore: store}
+	res, _, err := checker.Check(env, fictionalDeviceA, time.Time{})
+	if err != nil || !res.Valid {
+		t.Fatalf("check failed: %v", err)
+	}
+	if !res.FeatureAvailable("scan") || !res.OperationAvailable("print", "view") || res.OperationAvailable("print", "export") {
+		t.Fatalf("wrong active scope: effective=%v suspended=%v restrictions=%+v", res.EffectiveFeatures, res.SuspendedFeatures, res.Restrictions)
+	}
+	if len(res.Restrictions) != 1 || res.Restrictions[0].RecordID != "S2" || res.Restrictions[0].NotAfter != rfc(day(17)) {
+		t.Fatalf("check must use the truncated S2 fact: %+v", res.Restrictions)
+	}
+
+	checker.Clock = &fakeClock{day(18)}
+	res, _, _ = checker.Check(env, fictionalDeviceA, time.Time{})
+	if !res.OperationAvailable("print", "export") || len(res.Restrictions) != 0 {
+		t.Fatalf("ended restriction must no longer be active: %+v", res.Restrictions)
+	}
+
+	usages := []UsageRecord{
+		{LicenseID: "lic-1", Feature: "scan", Operation: "run", Time: day(15)},
+		{LicenseID: "lic-1", Feature: "print", Operation: "export", Time: day(16).Add(12 * time.Hour)},
+		{LicenseID: "lic-1", Feature: "print", Operation: "export", Time: day(18)},
+	}
+	items := store.Review(usages)
+	if len(items) != 1 || items[0].Usage.Time != day(16).Add(12*time.Hour) || items[0].Fact.RecordID != "S2" {
+		t.Fatalf("only usage in the truncated interval is reviewed: %+v", items)
 	}
 }
 

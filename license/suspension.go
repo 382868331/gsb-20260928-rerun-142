@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 )
 
@@ -99,14 +100,27 @@ func (s *SignedSuspensionList) Verify(kr *KeyRing) error {
 	return nil
 }
 
-// validateSuspensionList enforces structural and kind rules. The list's
-// GeneratedAt is the decision instant: cancel-scheduled is only legal for
-// suspensions that have not started yet, end-early only for ones that
-// have. Mixing them up is rejected instead of silently reinterpreted.
-func validateSuspensionList(l *SuspensionList) error {
+// validateSuspensionList enforces structural and kind rules. A record's
+// kind is judged at the instant when that record is first confirmed. When
+// the same immutable record is carried by a later cumulative list, the
+// previous list's GeneratedAt remains its decision instant; the current
+// list generation time must not turn an already-confirmed historical
+// cancellation into a late cancellation.
+func validateSuspensionList(l, previous *SuspensionList) error {
 	gen, err := time.Parse(time.RFC3339, l.GeneratedAt)
 	if err != nil {
 		return fmt.Errorf("%w: bad generated_at", ErrMalformedSuspensionList)
+	}
+	var prevGen time.Time
+	previousRecords := map[string]SuspensionRecord{}
+	if previous != nil {
+		prevGen, err = time.Parse(time.RFC3339, previous.GeneratedAt)
+		if err != nil {
+			return fmt.Errorf("%w: bad previous generated_at", ErrMalformedSuspensionList)
+		}
+		for _, old := range previous.Records {
+			previousRecords[old.RecordID] = old
+		}
 	}
 	seen := map[string]bool{}
 	suspends := map[string]SuspensionRecord{}
@@ -115,11 +129,18 @@ func validateSuspensionList(l *SuspensionList) error {
 			return fmt.Errorf("%w: duplicate or empty record id", ErrInvalidSuspensionRecord)
 		}
 		seen[r.RecordID] = true
+		if old, ok := previousRecords[r.RecordID]; ok && !reflect.DeepEqual(old, r) {
+			return fmt.Errorf("%w: record %q changed after confirmation", ErrInvalidSuspensionRecord, r.RecordID)
+		}
 		if r.Kind == Suspend {
 			suspends[r.RecordID] = r
 		}
 	}
 	for _, r := range l.Records {
+		decisionAt := gen
+		if _, known := previousRecords[r.RecordID]; known {
+			decisionAt = prevGen
+		}
 		switch r.Kind {
 		case Suspend:
 			if r.LicenseID == "" {
@@ -136,9 +157,9 @@ func validateSuspensionList(l *SuspensionList) error {
 				return fmt.Errorf("%w: cancel %q targets unknown record", ErrInvalidSuspensionRecord, r.RecordID)
 			}
 			nbf, _ := time.Parse(time.RFC3339, tgt.NotBefore)
-			if !nbf.After(gen) {
-				return fmt.Errorf("%w: cancel %q targets a suspension that already started; use end-early",
-					ErrInvalidSuspensionRecord, r.RecordID)
+			if !nbf.After(decisionAt) {
+				return fmt.Errorf("%w: cancel %q targets suspension %q that already started; use end-early",
+					ErrInvalidSuspensionRecord, r.RecordID, r.TargetRecordID)
 			}
 		case EndEarly:
 			tgt, ok := suspends[r.TargetRecordID]
@@ -151,7 +172,7 @@ func validateSuspensionList(l *SuspensionList) error {
 			if err != nil {
 				return fmt.Errorf("%w: end %q has a bad ended_at", ErrInvalidSuspensionRecord, r.RecordID)
 			}
-			if nbf.After(gen) {
+			if nbf.After(decisionAt) {
 				return fmt.Errorf("%w: end %q targets a suspension that has not started; use cancel-scheduled",
 					ErrInvalidSuspensionRecord, r.RecordID)
 			}
