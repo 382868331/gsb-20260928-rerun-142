@@ -53,11 +53,33 @@ func (s *SuspensionStore) Import(kr *KeyRing, list *SignedSuspensionList) error 
 	if list == nil {
 		return ErrMalformedSuspensionList
 	}
+	id := list.List.IssuerID
+	cur := s.states[id]
+	if err := validateIncomingSuspension(kr, cur, list); err != nil {
+		return err
+	}
+	next := &issuerSuspensionState{Serial: list.List.Serial, Latest: list}
+	if err := s.writeLocked(next, id); err != nil {
+		return err
+	}
+	s.states[id] = next
+	return nil
+}
+
+// validateIncomingSuspension runs every check an update must pass before
+// it may replace the confirmed state: signature against the trusted ring,
+// strictly increasing serial, structural/kind rules (with carried-over
+// records keeping their original decision instant) and cumulativeness.
+// It is shared by Import (which then commits) and Preview (which never
+// does), so a preview is accepted exactly when the real update would be.
+func validateIncomingSuspension(kr *KeyRing, cur *issuerSuspensionState, list *SignedSuspensionList) error {
+	if list == nil {
+		return ErrMalformedSuspensionList
+	}
 	if err := list.Verify(kr); err != nil {
 		return err
 	}
 	id := list.List.IssuerID
-	cur := s.states[id]
 	if cur != nil && list.List.Serial <= cur.Serial {
 		return fmt.Errorf("%w: issuer=%s known_serial=%d incoming_serial=%d",
 			ErrStaleSuspensionData, id, cur.Serial, list.List.Serial)
@@ -87,11 +109,6 @@ func (s *SuspensionStore) Import(kr *KeyRing, list *SignedSuspensionList) error 
 			}
 		}
 	}
-	next := &issuerSuspensionState{Serial: list.List.Serial, Latest: list}
-	if err := s.writeLocked(next, id); err != nil {
-		return err
-	}
-	s.states[id] = next
 	return nil
 }
 

@@ -16,6 +16,9 @@
   取消未开始停用与提前结束生效中停用两种不同记录、使用记录复核。
 - `license/suspension_store.go`：按签发者持久化的最新停用状态；严格单调、
   累积、原子替换，是离线期间保留的最近确认限制依据。
+- `license/suspension_preview.go`：停用资料更新的**只读预览**。按功能与操作
+  展示新资料会撤销或恢复哪些权限，列出适用的停用/取消/提前结束依据记录，
+  并单独列出历史使用复核变化；不提交更新、不推进可信时间、不改写使用记录。
 - `license/delegate.go`：受限转授（子授权）签发与范围约束校验。
 - `license/clock_anchor.go`：系统时间倒退的明确处理规则与持久化锚点。
 - `license/checker.go`：统一检查入口 `Checker.Check` / `Checker.CheckChain`。
@@ -71,7 +74,16 @@
     复核。只有落在限制生效区间内的使用才会被标记——后来生效的限制绝不
     改写成过去已经生效。每次验证结果（`Result.Restrictions`）都列出实际
     采用的限制事实（记录 ID、serial、区间），无签名数据时
-    `SuspensionsKnown=false`，绝不把“无数据”说成“无限制”。
+     `SuspensionsKnown=false`，绝不把“无数据”说成“无限制”。
+13. **更新预览（只读）**：`SuspensionStore.Preview` / `suspend-preview` 对待
+    导入的停用列表执行与正式导入完全相同的校验（签名、serial 单调、记录
+    累积、取消/结束记录的判定时刻），`accepted=false` 时给出拒绝原因且现有
+    可信状态不变。接受时按（授权、功能、操作）给出当前权限变化
+    （`revoked`/`restored`；停用资料只能限制或恢复权限，`added` 恒为空），
+    每条变化都标注依据记录；`usage_review_changes` 单独列出新资料会**新增**
+    标记的历史使用记录，与当前权限变化严格区分。预览使用回拨保护后的有效
+    时间但**不推进锚点**、不写存储、不改写使用记录；`--out` 保存的预览
+    JSON 含完整依据记录，旧预览可随时回看原依据。
 
 ## 命令行用法（全部离线）
 
@@ -94,6 +106,10 @@ go build ./cmd/license-tool
   --serial 1 --out susp1.json                          # 签发局部停用列表
 ./license-tool suspend-import --keyring keyring.json \
   --store susp-store.json --suspensions susp1.json     # 单调导入，回退拒绝
+./license-tool suspend-preview --keyring keyring.json \
+  --store susp-store.json --suspensions susp2.json \
+  --license lic.json --anchor anchor.txt \
+  --usage usage.json --out preview2.json               # 只读预览，可存档回看
 ./license-tool usage-review --store susp-store.json \
   --usage usage.json                                   # 复核已有使用记录
 ./license-tool check --license lic.json --device DEV-X \
@@ -128,5 +144,7 @@ go test ./...
 局部停用区间收窄、交叉区间与操作级限制、祖先停用向叶级传播、取消未开始与
 提前结束的记录区分、使用记录复核不溯及既往、时钟回拨下停用仍然生效、
 停用存储单调与保存重开后可用范围一致、
+更新只读预览与实际接受后的权限一致、无效签名/首次迟到取消/过期累计资料的
+预览拒绝与状态保持、时钟回拨下预览不推进锚点、保存的预览可回看原依据、
 功能项与有效期及设备身份篡改、损坏授权、虚构设备绑定、版本变更、撤销列表损坏/
 资料缺失（三态）。

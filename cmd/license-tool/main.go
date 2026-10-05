@@ -38,6 +38,8 @@ func main() {
 		err = cmdSuspend(os.Args[2:])
 	case "suspend-import":
 		err = cmdSuspendImport(os.Args[2:])
+	case "suspend-preview":
+		err = cmdSuspendPreview(os.Args[2:])
 	case "usage-review":
 		err = cmdUsageReview(os.Args[2:])
 	case "check":
@@ -72,6 +74,15 @@ commands:
               (records file: JSON array of suspension records; kinds:
                suspend / cancel-scheduled / end-early)
   suspend-import --keyring FILE --store FILE --suspensions FILE
+  suspend-preview --keyring FILE --store FILE --suspensions FILE
+              --license FILE[,FILE...] --anchor FILE
+              [--usage FILE] [--out FILE]
+              (READ-ONLY: shows which permissions the update would revoke
+               or restore per feature/operation, which past usages would
+               newly need review, and the applicable suspend/cancel/
+               end-early records; commits nothing, never advances the
+               anchor, never rewrites usage history; --out saves the
+               preview JSON so an old preview can be re-opened later)
   usage-review --store FILE --usage FILE
               (usage file: JSON array of records with license_id, feature,
                operation, time; prints which past usages need review
@@ -487,6 +498,115 @@ func cmdSuspendImport(args []string) error {
 	}
 	fmt.Printf("imported issuer=%s serial=%d records=%d\n",
 		list.List.IssuerID, list.List.Serial, len(list.List.Records))
+	return nil
+}
+
+func cmdSuspendPreview(args []string) error {
+	// READ-ONLY preview of a suspension data update. It runs the same
+	// validation as suspend-import and reports what would change, but it
+	// never commits the update, never advances the time anchor and never
+	// rewrites usage history.
+	fs := flag.NewFlagSet("suspend-preview", flag.ContinueOnError)
+	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
+	storePath := fs.String("store", "suspension-store.json", "local suspension state store")
+	suspPath := fs.String("suspensions", "", "signed suspension list to preview")
+	licensePath := fs.String("license", "", "comma-separated root-to-leaf license chain")
+	anchorPath := fs.String("anchor", "anchor.txt", "per-device monotonic time anchor (read, never advanced)")
+	usagePath := fs.String("usage", "", "JSON array of existing usage records (optional)")
+	outPath := fs.String("out", "", "save the full preview JSON here for later review (optional)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *suspPath == "" || *licensePath == "" {
+		return fmt.Errorf("--suspensions and --license are required")
+	}
+	ring, err := license.LoadKeyRing(*ringPath)
+	if err != nil {
+		return err
+	}
+	list, err := loadSuspensions(*suspPath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadSuspensionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	var chain []*license.Envelope
+	for _, part := range strings.Split(*licensePath, ",") {
+		data, err := os.ReadFile(strings.TrimSpace(part))
+		if err != nil {
+			return err
+		}
+		env, err := license.ParseEnvelope(data)
+		if err != nil {
+			return err
+		}
+		chain = append(chain, env)
+	}
+	// The anchor is READ to compute the rollback-protected evaluation
+	// time; unlike check, a preview never advances it.
+	anchor := license.NewFileAnchor(*anchorPath)
+	last, err := anchor.Last()
+	if err != nil {
+		return err
+	}
+	var usages []license.UsageRecord
+	if *usagePath != "" {
+		data, err := os.ReadFile(*usagePath)
+		if err != nil {
+			return err
+		}
+		if err := jsonUnmarshal(data, &usages); err != nil {
+			return err
+		}
+	}
+	p := store.Preview(ring, list, chain, usages, time.Now(), last)
+	if !p.Accepted {
+		fmt.Printf("accepted=false issuer=%s current_serial=%d incoming_serial=%d reject_reason=%q\n",
+			p.IssuerID, p.CurrentSerial, p.IncomingSerial, p.RejectReason)
+	} else {
+		fmt.Printf("accepted=true issuer=%s current_serial=%d incoming_serial=%d evaluated_at=%s clock_rolled_back=%v\n",
+			p.IssuerID, p.CurrentSerial, p.IncomingSerial,
+			p.EvaluatedAt.UTC().Format(time.RFC3339), p.ClockRolledBack)
+	}
+	for _, ch := range p.PermissionChanges {
+		op := ch.Operation
+		if op == "" {
+			op = "(whole feature)"
+		}
+		var basis []string
+		for _, b := range ch.Basis {
+			basis = append(basis, fmt.Sprintf("%s(%s,serial=%d)", b.RecordID, b.Kind, b.Serial))
+		}
+		fmt.Printf("permission_change kind=%s license=%s feature=%s operation=%s basis=%v\n",
+			ch.Change, ch.LicenseID, ch.Feature, op, basis)
+	}
+	for _, it := range p.UsageReviewChanges {
+		fmt.Printf("usage_review_change license=%s feature=%s operation=%s used_at=%s fact=%s serial=%d interval=%s..%s\n",
+			it.Usage.LicenseID, it.Usage.Feature, it.Usage.Operation,
+			it.Usage.Time.UTC().Format(time.RFC3339),
+			it.Fact.RecordID, it.Fact.Serial, it.Fact.NotBefore, it.Fact.NotAfter)
+	}
+	for _, r := range p.Records {
+		fmt.Printf("basis_record id=%s kind=%s serial=%d license=%s features=%v operations=%v interval=%s..%s target=%s ended_at=%s\n",
+			r.RecordID, r.Kind, r.Serial, r.LicenseID, r.Features, r.Operations,
+			r.NotBefore, r.NotAfter, r.TargetRecordID, r.EndedAt)
+	}
+	fmt.Printf("permission_changes=%d usage_review_changes=%d basis_records=%d\n",
+		len(p.PermissionChanges), len(p.UsageReviewChanges), len(p.Records))
+	if *outPath != "" {
+		data, err := jsonMarshalIndent(p)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(*outPath, data, 0o644); err != nil {
+			return err
+		}
+	}
+	if !p.Accepted {
+		return fmt.Errorf("preview rejected: %s", p.RejectReason)
+	}
 	return nil
 }
 
