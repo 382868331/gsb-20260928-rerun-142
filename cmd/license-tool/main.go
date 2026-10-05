@@ -38,6 +38,8 @@ func main() {
 		err = cmdSuspend(os.Args[2:])
 	case "suspend-import":
 		err = cmdSuspendImport(os.Args[2:])
+	case "suspend-preview":
+		err = cmdSuspendPreview(os.Args[2:])
 	case "usage-review":
 		err = cmdUsageReview(os.Args[2:])
 	case "check":
@@ -72,6 +74,13 @@ commands:
               (records file: JSON array of suspension records; kinds:
                suspend / cancel-scheduled / end-early)
   suspend-import --keyring FILE --store FILE --suspensions FILE
+  suspend-preview --keyring FILE --store FILE --suspensions FILE
+              [--license root.json,...,leaf.json] [--operations a,b]
+              [--usage FILE] [--at RFC3339] [--out preview.json]
+              (read-only: prints the permission diff the update would
+               cause; never commits, never advances the time anchor)
+  suspend-preview --view preview.json
+              (re-print a previously saved preview with its original basis)
   usage-review --store FILE --usage FILE
               (usage file: JSON array of records with license_id, feature,
                operation, time; prints which past usages need review
@@ -488,6 +497,142 @@ func cmdSuspendImport(args []string) error {
 	fmt.Printf("imported issuer=%s serial=%d records=%d\n",
 		list.List.IssuerID, list.List.Serial, len(list.List.Records))
 	return nil
+}
+
+func cmdSuspendPreview(args []string) error {
+	// Read-only preview of a suspension update: validates the candidate
+	// list exactly like suspend-import would, prints the would-be
+	// permission diff and the applicable records, and changes NOTHING --
+	// the store file, the time anchor and usage history stay untouched.
+	fs := flag.NewFlagSet("suspend-preview", flag.ContinueOnError)
+	ringPath := fs.String("keyring", "keyring.json", "trusted public key ring")
+	storePath := fs.String("store", "suspension-store.json", "local suspension state store")
+	suspPath := fs.String("suspensions", "", "candidate signed suspension list")
+	licensePath := fs.String("license", "", "optional comma-separated root-to-leaf chain to evaluate")
+	opsFlag := fs.String("operations", "", "optional comma-separated operations to evaluate")
+	usagePath := fs.String("usage", "", "optional JSON array of usage records for the review diff")
+	at := fs.String("at", "", "evaluation time (RFC3339), default now; never persisted")
+	outPath := fs.String("out", "", "optional file to save the preview JSON for later viewing")
+	viewPath := fs.String("view", "", "re-print a previously saved preview and stop")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *viewPath != "" {
+		data, err := os.ReadFile(*viewPath)
+		if err != nil {
+			return err
+		}
+		var p license.SuspensionPreview
+		if err := jsonUnmarshal(data, &p); err != nil {
+			return err
+		}
+		printPreview(&p)
+		return nil
+	}
+	if *suspPath == "" {
+		return fmt.Errorf("--suspensions is required")
+	}
+	ring, err := license.LoadKeyRing(*ringPath)
+	if err != nil {
+		return err
+	}
+	list, err := loadSuspensions(*suspPath)
+	if err != nil {
+		return err
+	}
+	store, err := license.LoadSuspensionStore(*storePath)
+	if err != nil {
+		return err
+	}
+	eval := time.Now().UTC()
+	if *at != "" {
+		eval, err = time.Parse(time.RFC3339, *at)
+		if err != nil {
+			return err
+		}
+	}
+	var scopes []license.PreviewScope
+	if *licensePath != "" {
+		scope := license.PreviewScope{}
+		for _, part := range strings.Split(*licensePath, ",") {
+			data, err := os.ReadFile(strings.TrimSpace(part))
+			if err != nil {
+				return err
+			}
+			env, err := license.ParseEnvelope(data)
+			if err != nil {
+				return err
+			}
+			scope.Chain = append(scope.Chain, env.License.LicenseID)
+			scope.LicenseID = env.License.LicenseID
+			scope.Features = env.License.Features
+		}
+		for _, op := range strings.Split(*opsFlag, ",") {
+			if op = strings.TrimSpace(op); op != "" {
+				scope.Operations = append(scope.Operations, op)
+			}
+		}
+		scopes = append(scopes, scope)
+	}
+	var usages []license.UsageRecord
+	if *usagePath != "" {
+		data, err := os.ReadFile(*usagePath)
+		if err != nil {
+			return err
+		}
+		if err := jsonUnmarshal(data, &usages); err != nil {
+			return err
+		}
+	}
+	p := store.Preview(ring, list, eval, scopes, usages)
+	printPreview(p)
+	if *outPath != "" {
+		data, err := jsonMarshalIndent(p)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(*outPath, data, 0o600); err != nil {
+			return err
+		}
+	}
+	if !p.Accepted {
+		return fmt.Errorf("preview rejected: %s", p.RejectReason)
+	}
+	return nil
+}
+
+func printPreview(p *license.SuspensionPreview) {
+	fmt.Printf("preview issuer=%s current_serial=%d incoming_serial=%d evaluated_at=%s accepted=%v\n",
+		p.IssuerID, p.CurrentSerial, p.IncomingSerial, p.EvaluatedAt.Format(time.RFC3339), p.Accepted)
+	if p.RejectReason != "" {
+		fmt.Printf("reject_reason=%s\n", p.RejectReason)
+		return
+	}
+	for _, r := range p.NewRecords {
+		fmt.Printf("new_record kind=%s record=%s license=%s features=%v operations=%v interval=%s..%s target=%s ended_at=%s\n",
+			r.Kind, r.RecordID, r.LicenseID, r.Features, r.Operations, r.NotBefore, r.NotAfter,
+			r.TargetRecordID, r.EndedAt)
+	}
+	for _, ch := range p.Changes {
+		fmt.Printf("change kind=%s license=%s feature=%s operation=%s\n",
+			ch.Kind, ch.LicenseID, ch.Feature, ch.Operation)
+		for _, f := range ch.Basis {
+			fmt.Printf("  basis record=%s serial=%d interval=%s..%s\n",
+				f.RecordID, f.Serial, f.NotBefore, f.NotAfter)
+		}
+	}
+	if p.UsageReview != nil {
+		for _, it := range p.UsageReview.NewlyFlagged {
+			fmt.Printf("usage_review newly_flagged license=%s feature=%s operation=%s used_at=%s fact=%s serial=%d\n",
+				it.Usage.LicenseID, it.Usage.Feature, it.Usage.Operation,
+				it.Usage.Time.UTC().Format(time.RFC3339), it.Fact.RecordID, it.Fact.Serial)
+		}
+		for _, it := range p.UsageReview.Cleared {
+			fmt.Printf("usage_review cleared license=%s feature=%s operation=%s used_at=%s fact=%s serial=%d\n",
+				it.Usage.LicenseID, it.Usage.Feature, it.Usage.Operation,
+				it.Usage.Time.UTC().Format(time.RFC3339), it.Fact.RecordID, it.Fact.Serial)
+		}
+	}
 }
 
 func cmdUsageReview(args []string) error {

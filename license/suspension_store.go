@@ -50,6 +50,22 @@ func LoadSuspensionStore(path string) (*SuspensionStore, error) {
 func (s *SuspensionStore) Import(kr *KeyRing, list *SignedSuspensionList) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.validateIncomingLocked(kr, list); err != nil {
+		return err
+	}
+	id := list.List.IssuerID
+	next := &issuerSuspensionState{Serial: list.List.Serial, Latest: list}
+	if err := s.writeLocked(next, id); err != nil {
+		return err
+	}
+	s.states[id] = next
+	return nil
+}
+
+// validateIncomingLocked runs every check Import applies to a candidate
+// list, without changing any state. Preview uses exactly the same rules,
+// so a preview's accept/reject verdict always matches a real import.
+func (s *SuspensionStore) validateIncomingLocked(kr *KeyRing, list *SignedSuspensionList) error {
 	if list == nil {
 		return ErrMalformedSuspensionList
 	}
@@ -87,11 +103,6 @@ func (s *SuspensionStore) Import(kr *KeyRing, list *SignedSuspensionList) error 
 			}
 		}
 	}
-	next := &issuerSuspensionState{Serial: list.List.Serial, Latest: list}
-	if err := s.writeLocked(next, id); err != nil {
-		return err
-	}
-	s.states[id] = next
 	return nil
 }
 
